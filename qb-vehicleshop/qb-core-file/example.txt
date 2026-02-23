@@ -1,0 +1,1 @@
+this is example shared code lua in directory qb-core/shared/vehicle.lua
