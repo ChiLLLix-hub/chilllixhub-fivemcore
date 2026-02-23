@@ -25,6 +25,12 @@ local prevJobs = {}
 -- fires BEFORE the player entry is removed from QBCore.Players.
 local pendingDisconnects = {}
 
+-- Tracks which source IDs are loading a brand-new character so that
+-- QBCore:Server:PlayerLoaded can send the correct log and chat message.
+-- We hook qb-multicharacter:server:createCharacter with RegisterNetEvent
+-- (required so that `source` is the real player server ID, not 0).
+local pendingNewChars = {}
+
 -- ── Helpers ──────────────────────────────────────────────────────
 
 --- Return current date (YYYY-MM-DD) and time (HH:MM:SS) strings.
@@ -40,7 +46,10 @@ local function SendDiscordEmbed(logType, embed)
     if not webhookKey then return end
 
     local url = Config.Webhooks[webhookKey]
-    if not url or url == '' then return end
+    if not url or url == '' then
+        print('^3[chilllixhub-customlog]^7 No webhook URL set for "' .. webhookKey .. '" (log type: ' .. logType .. '). Check config.lua.')
+        return
+    end
 
     local date, time = GetDateTime()
     embed.footer = { text = Config.ServerName .. '  •  ' .. date .. '  ' .. time }
@@ -51,7 +60,11 @@ local function SendDiscordEmbed(logType, embed)
         embeds     = { embed },
     })
 
-    PerformHttpRequest(url, function() end, 'POST', payload, { ['Content-Type'] = 'application/json' })
+    PerformHttpRequest(url, function(statusCode, responseBody)
+        if statusCode ~= 200 and statusCode ~= 204 then
+            print('^1[chilllixhub-customlog]^7 Discord webhook error for "' .. logType .. '": HTTP ' .. tostring(statusCode) .. ' – ' .. tostring(responseBody))
+        end
+    end, 'POST', payload, { ['Content-Type'] = 'application/json' })
 end
 
 --- Broadcast a server announcement in okokChat.
@@ -67,48 +80,79 @@ local function ChatAnnounce(message, color)
     })
 end
 
--- ── 1. playerConnect – returning character ───────────────────────
+-- ── 1 & 3. playerConnect / playerNew ─────────────────────────────
 --
---  We hook the qb-multicharacter net-event that fires when a player
---  selects an EXISTING character.  We wait in a polling loop until
---  QBCore has fully registered the player, then read their data.
+--  Problem with the previous approach:
+--    AddEventHandler on a net event registered by ANOTHER resource
+--    causes `source` to be 0 instead of the real player server ID.
+--    QBCore.Functions.GetPlayer(0) always returns nil, so the poll
+--    loop timed out silently and no log was ever sent.
+--
+--  Fix:
+--    * Use QBCore:Server:PlayerLoaded (a plain server→server TriggerEvent,
+--      no net-event issues) — it passes the fully-loaded Player object
+--      directly, no polling needed.
+--    * Flag new characters via RegisterNetEvent on createCharacter
+--      (so `source` IS the real player server ID in our resource).
 
-AddEventHandler('qb-multicharacter:server:loadUserData', function()
-    local src = source
-    Citizen.CreateThread(function()
-        -- Wait until QBCore has registered the player (Login is async)
-        local tries = 0
-        while not QBCore.Functions.GetPlayer(src) and tries < 50 do
-            Citizen.Wait(100)
-            tries = tries + 1
-        end
+-- Mark which source IDs are loading a brand-new character.
+-- RegisterNetEvent is required so that `source` is the real player
+-- server ID and not 0 when the handler fires in our resource.
+RegisterNetEvent('qb-multicharacter:server:createCharacter', function()
+    pendingNewChars[source] = true
+end)
 
-        local Player = QBCore.Functions.GetPlayer(src)
-        if not Player then return end
+-- Fires after QBCore finishes loading the player (new OR returning).
+AddEventHandler('QBCore:Server:PlayerLoaded', function(Player)
+    local src       = Player.PlayerData.source
+    local isNew     = pendingNewChars[src]
+    pendingNewChars[src] = nil  -- clean up flag
 
-        local date, time = GetDateTime()
-        local name      = GetPlayerName(src) or 'Unknown'
-        local citizenid = Player.PlayerData.citizenid
-        local license   = Player.PlayerData.license
-        local ip        = GetPlayerEndpoint(src) or 'Unknown'
+    local date, time = GetDateTime()
+    local name      = Player.PlayerData.name or 'Unknown'
+    local citizenid = Player.PlayerData.citizenid
+    local license   = Player.PlayerData.license
+    local ip        = GetPlayerEndpoint(src) or 'Unknown'
 
-        -- Discord embed
+    if isNew then
+        -- ── 3. playerNew
+        SendDiscordEmbed('playerNew', {
+            title  = '🆕  New Citizen Arrived',
+            color  = Config.Colors.playerNew,
+            fields = {
+                { name = 'Player Name',  value = name,       inline = true  },
+                { name = 'Character ID', value = citizenid,  inline = true  },
+                { name = 'License',      value = license,    inline = false },
+                { name = 'IP Address',   value = ip,         inline = true  },
+                { name = 'Date',         value = date,       inline = true  },
+                { name = 'Time',         value = time,       inline = true  },
+            },
+        })
+        ChatAnnounce('New citizen has arrived. Welcome ' .. name .. '!', Config.ChatColors.playerNew)
+    else
+        -- ── 1. playerConnect (returning character)
         SendDiscordEmbed('playerConnect', {
             title  = '🟢  Player Connected',
             color  = Config.Colors.playerConnect,
             fields = {
-                { name = 'Player Name',   value = name,       inline = true  },
-                { name = 'Character ID',  value = citizenid,  inline = true  },
-                { name = 'License',       value = license,    inline = false },
-                { name = 'IP Address',    value = ip,         inline = true  },
-                { name = 'Date',          value = date,       inline = true  },
-                { name = 'Time',          value = time,       inline = true  },
+                { name = 'Player Name',  value = name,       inline = true  },
+                { name = 'Character ID', value = citizenid,  inline = true  },
+                { name = 'License',      value = license,    inline = false },
+                { name = 'IP Address',   value = ip,         inline = true  },
+                { name = 'Date',         value = date,       inline = true  },
+                { name = 'Time',         value = time,       inline = true  },
             },
         })
-
-        -- okokChat broadcast
         ChatAnnounce('Welcome back ' .. name .. '!', Config.ChatColors.playerConnect)
-    end)
+    end
+
+    -- Seed the job cache so the first job-change event has a previous job to compare against.
+    local job = Player.PlayerData.job
+    prevJobs[src] = {
+        name  = job.name,
+        label = job.label,
+        grade = { level = job.grade.level, name = job.grade.name },
+    }
 end)
 
 -- ── 2. playerDisconnect ──────────────────────────────────────────
@@ -125,7 +169,6 @@ AddEventHandler('QBCore:Server:PlayerDropped', function(Player)
         citizenid = Player.PlayerData.citizenid,
         license   = Player.PlayerData.license,
     }
-    -- Tidy up the job cache here as well
     prevJobs[src] = nil
 end)
 
@@ -151,48 +194,6 @@ AddEventHandler('playerDropped', function(reason)
     })
 end)
 
--- ── 3. playerNew – brand-new character ──────────────────────────
---
---  We hook the qb-multicharacter net-event that fires when a player
---  CREATES a new character.  Same polling approach as playerConnect.
-
-AddEventHandler('qb-multicharacter:server:createCharacter', function()
-    local src = source
-    Citizen.CreateThread(function()
-        local tries = 0
-        while not QBCore.Functions.GetPlayer(src) and tries < 50 do
-            Citizen.Wait(100)
-            tries = tries + 1
-        end
-
-        local Player = QBCore.Functions.GetPlayer(src)
-        if not Player then return end
-
-        local date, time = GetDateTime()
-        local name      = GetPlayerName(src) or 'Unknown'
-        local citizenid = Player.PlayerData.citizenid
-        local license   = Player.PlayerData.license
-        local ip        = GetPlayerEndpoint(src) or 'Unknown'
-
-        -- Discord embed
-        SendDiscordEmbed('playerNew', {
-            title  = '🆕  New Citizen Arrived',
-            color  = Config.Colors.playerNew,
-            fields = {
-                { name = 'Player Name',   value = name,       inline = true  },
-                { name = 'Character ID',  value = citizenid,  inline = true  },
-                { name = 'License',       value = license,    inline = false },
-                { name = 'IP Address',    value = ip,         inline = true  },
-                { name = 'Date',          value = date,       inline = true  },
-                { name = 'Time',          value = time,       inline = true  },
-            },
-        })
-
-        -- okokChat broadcast
-        ChatAnnounce('New citizen has arrived. Welcome ' .. name .. '!', Config.ChatColors.playerNew)
-    end)
-end)
-
 -- ── 4. playerDied ────────────────────────────────────────────────
 --
 --  Triggered from client/main.lua when the QBCore `isdead` metadata
@@ -214,8 +215,8 @@ AddEventHandler('chilllixhub-customlog:server:playerDied', function(cause)
         title  = '💀  Player Died',
         color  = Config.Colors.playerDied,
         fields = {
-            { name = 'Player Name',   value = name,                 inline = true  },
-            { name = 'Character ID',  value = citizenid,            inline = true  },
+            { name = 'Player Name',    value = name,                inline = true  },
+            { name = 'Character ID',   value = citizenid,           inline = true  },
             { name = 'Cause / Reason', value = cause or 'Unknown',  inline = false },
             { name = 'Date',           value = date,                inline = true  },
             { name = 'Time',           value = time,                inline = true  },
@@ -228,17 +229,7 @@ end)
 --  QBCore fires QBCore:Server:OnJobUpdate for BOTH actual job changes
 --  and on-duty toggles.  We compare the new job name + grade level
 --  against the cached previous value and only log real job changes.
-
--- Cache initial jobs when each character loads
-AddEventHandler('QBCore:Server:PlayerLoaded', function(Player)
-    local src = Player.PlayerData.source
-    local job = Player.PlayerData.job
-    prevJobs[src] = {
-        name  = job.name,
-        label = job.label,
-        grade = { level = job.grade.level, name = job.grade.name },
-    }
-end)
+--  The job cache is now seeded inside QBCore:Server:PlayerLoaded above.
 
 AddEventHandler('QBCore:Server:OnJobUpdate', function(src, newJob)
     local Player = QBCore.Functions.GetPlayer(src)
@@ -271,14 +262,14 @@ AddEventHandler('QBCore:Server:OnJobUpdate', function(src, newJob)
         title  = '💼  Job Changed',
         color  = Config.Colors.jobChange,
         fields = {
-            { name = 'Player Name',         value = name,                                     inline = true  },
-            { name = 'Character ID',        value = citizenid,                                inline = true  },
-            { name = 'New Job',             value = newJob.label  or newJob.name,             inline = true  },
-            { name = 'New Job Rank',        value = newJob.grade  and newJob.grade.name  or 'Unknown', inline = true  },
-            { name = 'Previous Job',        value = lastJob.label or lastJob.name,            inline = true  },
-            { name = 'Previous Job Rank',   value = lastJob.grade and lastJob.grade.name or 'Unknown', inline = true  },
-            { name = 'Date',                value = date,                                     inline = true  },
-            { name = 'Time',                value = time,                                     inline = true  },
+            { name = 'Player Name',       value = name,                                          inline = true  },
+            { name = 'Character ID',      value = citizenid,                                     inline = true  },
+            { name = 'New Job',           value = newJob.label  or newJob.name,                  inline = true  },
+            { name = 'New Job Rank',      value = newJob.grade  and newJob.grade.name  or 'Unknown', inline = true  },
+            { name = 'Previous Job',      value = lastJob.label or lastJob.name,                 inline = true  },
+            { name = 'Previous Job Rank', value = lastJob.grade and lastJob.grade.name or 'Unknown', inline = true  },
+            { name = 'Date',              value = date,                                          inline = true  },
+            { name = 'Time',              value = time,                                          inline = true  },
         },
     })
 
@@ -293,4 +284,5 @@ end)
 -- Clean up on player unload
 AddEventHandler('QBCore:Server:OnPlayerUnload', function(src)
     prevJobs[src] = nil
+    pendingNewChars[src] = nil
 end)
