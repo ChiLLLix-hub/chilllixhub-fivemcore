@@ -28,7 +28,13 @@ local function GetDeathCause()
 end
 
 -- ── Death detection via QBCore metadata ──────────────────────────
+--
+-- Both events are fired from the server via TriggerClientEvent, so they
+-- must be declared as network-safe with RegisterNetEvent before being
+-- used in AddEventHandler.  Without this FiveM prints:
+--   "event <name> was not safe for net"
 
+RegisterNetEvent('QBCore:Player:SetPlayerData')
 AddEventHandler('QBCore:Player:SetPlayerData', function(PlayerData)
     if not LocalPlayer.state.isLoggedIn then return end
     if not PlayerData.metadata then return end
@@ -43,6 +49,7 @@ AddEventHandler('QBCore:Player:SetPlayerData', function(PlayerData)
 end)
 
 -- Reset flag on character unload
+RegisterNetEvent('QBCore:Client:OnPlayerUnload')
 AddEventHandler('QBCore:Client:OnPlayerUnload', function()
     wasDead = false
 end)
