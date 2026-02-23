@@ -123,11 +123,12 @@ AddEventHandler('QBCore:Server:PlayerLoaded', function(Player)
                 { name = 'Player Name',  value = name,       inline = true  },
                 { name = 'Character ID', value = citizenid,  inline = true  },
                 { name = 'License',      value = license,    inline = false },
-                { name = 'IP Address',   value = ip,         inline = true  },
+                { name = 'IP Address',   value = ip,         inline = true  }, -- Discord only; not in chat
                 { name = 'Date',         value = date,       inline = true  },
                 { name = 'Time',         value = time,       inline = true  },
             },
         })
+        -- IP is intentionally excluded from the chat broadcast
         ChatAnnounce('New citizen has arrived. Welcome ' .. name .. '!', Config.ChatColors.playerNew)
     else
         -- ── 1. playerConnect (returning character)
@@ -138,11 +139,12 @@ AddEventHandler('QBCore:Server:PlayerLoaded', function(Player)
                 { name = 'Player Name',  value = name,       inline = true  },
                 { name = 'Character ID', value = citizenid,  inline = true  },
                 { name = 'License',      value = license,    inline = false },
-                { name = 'IP Address',   value = ip,         inline = true  },
+                { name = 'IP Address',   value = ip,         inline = true  }, -- Discord only; not in chat
                 { name = 'Date',         value = date,       inline = true  },
                 { name = 'Time',         value = time,       inline = true  },
             },
         })
+        -- IP is intentionally excluded from the chat broadcast
         ChatAnnounce('Welcome back ' .. name .. '!', Config.ChatColors.playerConnect)
     end
 
@@ -286,3 +288,100 @@ AddEventHandler('QBCore:Server:OnPlayerUnload', function(src)
     prevJobs[src] = nil
     pendingNewChars[src] = nil
 end)
+
+-- ── Dev / test commands ───────────────────────────────────────────
+--
+--  Use these commands in-game (god / superadmin only) to verify that
+--  your Discord webhooks and okokChat announcements are working before
+--  real players trigger the live events.
+--
+--  Usage:  /logplayerconnect   /logplayerdisconnect   /logplayernew
+--          /logplayerdied      /logjobchange
+
+QBCore.Commands.Add('logplayerconnect', '[TEST] Send a dummy playerConnect log to Discord', {}, false, function(src)
+    local date, time = GetDateTime()
+    SendDiscordEmbed('playerConnect', {
+        title  = '🟢  Player Connected',
+        color  = Config.Colors.playerConnect,
+        fields = {
+            { name = 'Player Name',  value = 'TestPlayer',               inline = true  },
+            { name = 'Character ID', value = 'TEST001',                  inline = true  },
+            { name = 'License',      value = 'license:abc123def456',     inline = false },
+            { name = 'IP Address',   value = '203.0.113.1',              inline = true  },
+            { name = 'Date',         value = date,                        inline = true  },
+            { name = 'Time',         value = time,                        inline = true  },
+        },
+    })
+    ChatAnnounce('Welcome back TestPlayer!', Config.ChatColors.playerConnect)
+    TriggerClientEvent('QBCore:Notify', src, '[customlog] playerConnect test fired.', 'success')
+end, 'god')
+
+QBCore.Commands.Add('logplayerdisconnect', '[TEST] Send a dummy playerDisconnect log to Discord', {}, false, function(src)
+    local date, time = GetDateTime()
+    SendDiscordEmbed('playerDisconnect', {
+        title  = '🔴  Player Disconnected',
+        color  = Config.Colors.playerDisconnect,
+        fields = {
+            { name = 'Player Name',  value = 'TestPlayer',           inline = true  },
+            { name = 'Character ID', value = 'TEST001',              inline = true  },
+            { name = 'License',      value = 'license:abc123def456', inline = false },
+            { name = 'Reason',       value = 'Disconnected.',        inline = false },
+            { name = 'Date',         value = date,                    inline = true  },
+            { name = 'Time',         value = time,                    inline = true  },
+        },
+    })
+    TriggerClientEvent('QBCore:Notify', src, '[customlog] playerDisconnect test fired.', 'success')
+end, 'god')
+
+QBCore.Commands.Add('logplayernew', '[TEST] Send a dummy playerNew log to Discord', {}, false, function(src)
+    local date, time = GetDateTime()
+    SendDiscordEmbed('playerNew', {
+        title  = '🆕  New Citizen Arrived',
+        color  = Config.Colors.playerNew,
+        fields = {
+            { name = 'Player Name',  value = 'NewTestPlayer',            inline = true  },
+            { name = 'Character ID', value = 'TEST002',                  inline = true  },
+            { name = 'License',      value = 'license:xyz789ghi012',     inline = false },
+            { name = 'IP Address',   value = '203.0.113.2',              inline = true  },
+            { name = 'Date',         value = date,                        inline = true  },
+            { name = 'Time',         value = time,                        inline = true  },
+        },
+    })
+    ChatAnnounce('New citizen has arrived. Welcome NewTestPlayer!', Config.ChatColors.playerNew)
+    TriggerClientEvent('QBCore:Notify', src, '[customlog] playerNew test fired.', 'success')
+end, 'god')
+
+QBCore.Commands.Add('logplayerdied', '[TEST] Send a dummy playerDied log to Discord', {}, false, function(src)
+    local date, time = GetDateTime()
+    SendDiscordEmbed('playerDied', {
+        title  = '💀  Player Died',
+        color  = Config.Colors.playerDied,
+        fields = {
+            { name = 'Player Name',    value = 'TestPlayer',           inline = true  },
+            { name = 'Character ID',   value = 'TEST001',              inline = true  },
+            { name = 'Cause / Reason', value = 'Killed by player: AdminTest', inline = false },
+            { name = 'Date',           value = date,                    inline = true  },
+            { name = 'Time',           value = time,                    inline = true  },
+        },
+    })
+    TriggerClientEvent('QBCore:Notify', src, '[customlog] playerDied test fired.', 'success')
+end, 'god')
+
+QBCore.Commands.Add('logjobchange', '[TEST] Send a dummy jobChange log to Discord', {}, false, function(src)
+    local date, time = GetDateTime()
+    SendDiscordEmbed('jobChange', {
+        title  = '💼  Job Changed',
+        color  = Config.Colors.jobChange,
+        fields = {
+            { name = 'Player Name',       value = 'TestPlayer',  inline = true  },
+            { name = 'Character ID',      value = 'TEST001',     inline = true  },
+            { name = 'New Job',           value = 'Police',      inline = true  },
+            { name = 'New Job Rank',      value = 'Cadet',       inline = true  },
+            { name = 'Previous Job',      value = 'Unemployed',  inline = true  },
+            { name = 'Previous Job Rank', value = 'Freelancer',  inline = true  },
+            { name = 'Date',              value = date,           inline = true  },
+            { name = 'Time',              value = time,           inline = true  },
+        },
+    })
+    TriggerClientEvent('QBCore:Notify', src, '[customlog] jobChange test fired.', 'success')
+end, 'god')
