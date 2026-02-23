@@ -20,4 +20,5 @@ server_scripts {
 
 dependencies {
     'qb-core',
+    'qb-multicharacter',
 }
