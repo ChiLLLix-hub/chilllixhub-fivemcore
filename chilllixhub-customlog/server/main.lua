@@ -9,7 +9,7 @@
 --    5. jobChange        – job / grade changed
 --
 --  Discord messages are sent via webhook using Discord embeds.
---  Chat announcements use okokChat client events.
+--  Chat announcements use okokChat (if running) or native chat.
 -- ─────────────────────────────────────────────────────────────────
 
 local QBCore = exports['qb-core']:GetCoreObject()
@@ -19,9 +19,24 @@ local QBCore = exports['qb-core']:GetCoreObject()
 local prevJobs = {}
 
 -- Cache of basic player info (name / citizenid / license) populated
--- when a character is selected or created.  Consumed by playerDropped
--- so that the disconnect log works even after QBCore.Players is cleared.
+-- when a character finishes loading (QBCore:Server:PlayerLoaded).
+-- Consumed by playerDropped so disconnect logs work after QBCore.Players
+-- is already cleared.
 local playerCache = {}
+
+-- Flag set by the createCharacter handler so that the shared
+-- QBCore:Server:PlayerLoaded handler knows whether to log as new or returning.
+--
+-- Why the ordering is guaranteed:
+--   qb-multicharacter's createCharacter handler calls QBCore.Player.Login
+--   which calls CheckPlayerData → LoadInventory → MySQL.prepare.await.
+--   MySQL.prepare.await suspends qb-multicharacter's coroutine; the Lua
+--   scheduler then runs our createCharacter handler coroutine, which sets
+--   the flag.  PlayerLoaded can ONLY fire from inside CreatePlayer (called
+--   by CheckPlayerData, inside qb-multicharacter's coroutine).  Since that
+--   coroutine is suspended until MySQL returns, our flag is always set
+--   before PlayerLoaded fires.
+local pendingNewChars = {}
 
 -- ── Helpers ──────────────────────────────────────────────────────
 
@@ -59,22 +74,29 @@ local function SendDiscordEmbed(logType, embed)
     end, 'POST', payload, { ['Content-Type'] = 'application/json' })
 end
 
---- Broadcast a server announcement in okokChat.
---- Fires the event regardless of whether okokChat is detected as running;
---- if it is not installed, the TriggerClientEvent is simply a no-op.
+--- Broadcast a server announcement.
+--- Uses okokChat if the resource is running; falls back to the native
+--- FiveM chat:addMessage event (used by every other resource in this repo).
 --- @param message  string   Full message text
 --- @param color    table    { R, G, B }
 local function ChatAnnounce(message, color)
-    TriggerClientEvent('okokChat:client:addMessage', -1, {
-        color     = color,
-        multiline = true,
-        args      = { 'Server', message },
-    })
+    if GetResourceState('okokChat') == 'started' then
+        TriggerClientEvent('okokChat:client:addMessage', -1, {
+            color     = color,
+            multiline = true,
+            args      = { 'Server', message },
+        })
+    else
+        TriggerClientEvent('chat:addMessage', -1, {
+            color     = color,
+            multiline = true,
+            args      = { 'Server', message },
+        })
+    end
 end
 
 --- Populate the player cache and job cache for a freshly-loaded player.
---- Returns a table of the key fields used by the log embeds, or nil if
---- the player object is not available.
+--- Returns a table of the key fields used by the log embeds.
 --- @param src     number   Server source ID
 --- @param Player  table    QBCore Player object
 local function CachePlayer(src, Player)
@@ -89,7 +111,6 @@ local function CachePlayer(src, Player)
         label = job.label,
         grade = { level = job.grade.level, name = job.grade.name },
     }
-    -- Return the fields needed by log embeds to avoid repeating lookups
     return {
         name      = playerCache[src].name,
         citizenid = playerCache[src].citizenid,
@@ -98,75 +119,77 @@ local function CachePlayer(src, Player)
     }
 end
 
--- ── 1. playerConnect – returning character ───────────────────────
+-- ── 1 & 3. playerConnect / playerNew ─────────────────────────────
 --
---  FIX: We register a second handler on qb-multicharacter:server:loadUserData.
---  Since our resource starts AFTER qb-multicharacter (declared dependency),
---  qb-multicharacter's handler fires FIRST and calls QBCore.Player.Login
---  synchronously.  By the time OUR handler runs, the player is already
---  loaded in QBCore.Players — no polling required and `source` is correct.
+--  WHY QBCore:Server:PlayerLoaded and NOT direct loadUserData/createCharacter handlers:
+--
+--  QBCore.Player.Login (called inside qb-multicharacter's handlers) uses
+--  MySQL.prepare.await which suspends its coroutine. When it yields, our
+--  handler coroutine starts. At that moment QBCore.Functions.GetPlayer(src)
+--  returns nil because the DB query hasn't completed yet.
+--
+--  QBCore:Server:PlayerLoaded fires from inside CreatePlayer AFTER
+--  QBCore.Players[src] has been set (player.lua line 420-422), so the
+--  Player object is always available and correct.
+--
+--  For distinguishing new vs returning: our createCharacter handler only
+--  needs to set a flag (no GetPlayer call). It runs in a separate coroutine
+--  while qb-multicharacter's coroutine is suspended at MySQL, so the flag
+--  is always set before PlayerLoaded fires.
 
-RegisterNetEvent('qb-multicharacter:server:loadUserData', function()
-    local src    = source
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
-
-    local date, time = GetDateTime()
-    local info       = CachePlayer(src, Player)
-
-    SendDiscordEmbed('playerConnect', {
-        title  = '🟢  Player Connected',
-        color  = Config.Colors.playerConnect,
-        fields = {
-            { name = 'Player Name',  value = info.name,      inline = true  },
-            { name = 'Character ID', value = info.citizenid, inline = true  },
-            { name = 'License',      value = info.license,   inline = false },
-            { name = 'IP Address',   value = info.ip,        inline = true  }, -- Discord only; not in chat
-            { name = 'Date',         value = date,           inline = true  },
-            { name = 'Time',         value = time,           inline = true  },
-        },
-    })
-    -- IP is intentionally excluded from the chat broadcast
-    ChatAnnounce('Welcome back ' .. info.name .. '!', Config.ChatColors.playerConnect)
+-- Set the "new character" flag. Runs while qb-multicharacter's handler
+-- is suspended at MySQL, so the flag is ready before PlayerLoaded fires.
+RegisterNetEvent('qb-multicharacter:server:createCharacter', function()
+    pendingNewChars[source] = true
 end)
 
--- ── 3. playerNew – brand-new character ──────────────────────────
---
---  Same pattern as playerConnect: our handler runs AFTER qb-multicharacter's
---  createCharacter handler (which has already called QBCore.Player.Login).
-
-RegisterNetEvent('qb-multicharacter:server:createCharacter', function()
-    local src    = source
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
+-- Fires after QBCore fully registers the player (new OR returning).
+-- Player object is passed directly — no GetPlayer call needed.
+AddEventHandler('QBCore:Server:PlayerLoaded', function(Player)
+    local src   = Player.PlayerData.source
+    local isNew = pendingNewChars[src]
+    pendingNewChars[src] = nil
 
     local date, time = GetDateTime()
-    local info       = CachePlayer(src, Player)
+    local info = CachePlayer(src, Player)
 
-    SendDiscordEmbed('playerNew', {
-        title  = '🆕  New Citizen Arrived',
-        color  = Config.Colors.playerNew,
-        fields = {
-            { name = 'Player Name',  value = info.name,      inline = true  },
-            { name = 'Character ID', value = info.citizenid, inline = true  },
-            { name = 'License',      value = info.license,   inline = false },
-            { name = 'IP Address',   value = info.ip,        inline = true  }, -- Discord only; not in chat
-            { name = 'Date',         value = date,           inline = true  },
-            { name = 'Time',         value = time,           inline = true  },
-        },
-    })
-    -- IP is intentionally excluded from the chat broadcast
-    ChatAnnounce('New citizen has arrived. Welcome ' .. info.name .. '!', Config.ChatColors.playerNew)
+    if isNew then
+        -- ── 3. playerNew
+        SendDiscordEmbed('playerNew', {
+            title  = '🆕  New Citizen Arrived',
+            color  = Config.Colors.playerNew,
+            fields = {
+                { name = 'Player Name',  value = info.name,      inline = true  },
+                { name = 'Character ID', value = info.citizenid, inline = true  },
+                { name = 'License',      value = info.license,   inline = false },
+                { name = 'IP Address',   value = info.ip,        inline = true  }, -- Discord only; not in chat
+                { name = 'Date',         value = date,           inline = true  },
+                { name = 'Time',         value = time,           inline = true  },
+            },
+        })
+        ChatAnnounce('New citizen has arrived. Welcome ' .. info.name .. '!', Config.ChatColors.playerNew)
+    else
+        -- ── 1. playerConnect (returning character)
+        SendDiscordEmbed('playerConnect', {
+            title  = '🟢  Player Connected',
+            color  = Config.Colors.playerConnect,
+            fields = {
+                { name = 'Player Name',  value = info.name,      inline = true  },
+                { name = 'Character ID', value = info.citizenid, inline = true  },
+                { name = 'License',      value = info.license,   inline = false },
+                { name = 'IP Address',   value = info.ip,        inline = true  }, -- Discord only; not in chat
+                { name = 'Date',         value = date,           inline = true  },
+                { name = 'Time',         value = time,           inline = true  },
+            },
+        })
+        ChatAnnounce('Welcome back ' .. info.name .. '!', Config.ChatColors.playerConnect)
+    end
 end)
 
 -- ── 2. playerDisconnect ──────────────────────────────────────────
 --
---  FIX: Uses playerCache populated on character load instead of the
---  previous two-event pattern (QBCore:Server:PlayerDropped + playerDropped).
---  That pattern was fragile: if the player disconnected from character
---  select (no character loaded), QBCore:Server:PlayerDropped was never
---  fired and the log was silently skipped.  playerCache is populated
---  as soon as a character is selected or created, and is cleared here.
+--  playerCache is populated by QBCore:Server:PlayerLoaded above, so it
+--  is always set by the time playerDropped fires.
 
 AddEventHandler('playerDropped', function(reason)
     local src  = source
@@ -193,10 +216,8 @@ end)
 
 -- ── 4. playerDied ────────────────────────────────────────────────
 --
---  Triggered from client/main.lua.  The client uses a native
---  IsPedDeadOrDying polling thread — no dependency on the `isdead`
---  metadata being set by another resource.
---  External resources (e.g. qb-ambulancejob) can also call:
+--  Triggered from client/main.lua (IsPedDeadOrDying polling).
+--  External resources can also call:
 --      TriggerServerEvent('chilllixhub-customlog:server:playerDied', cause)
 
 RegisterNetEvent('chilllixhub-customlog:server:playerDied')
@@ -225,9 +246,8 @@ end)
 -- ── 5. jobChange ─────────────────────────────────────────────────
 --
 --  QBCore fires QBCore:Server:OnJobUpdate for BOTH actual job changes
---  and on-duty toggles.  We compare the new job name + grade level
---  against the cached previous value and only log real job changes.
---  The job cache is seeded via CachePlayer when the character loads.
+--  and on-duty toggles. We compare job name + grade level against the
+--  cached previous value and only log real job changes.
 
 AddEventHandler('QBCore:Server:OnJobUpdate', function(src, newJob)
     local Player = QBCore.Functions.GetPlayer(src)
@@ -235,7 +255,6 @@ AddEventHandler('QBCore:Server:OnJobUpdate', function(src, newJob)
 
     local lastJob = prevJobs[src]
 
-    -- If we have no cached data yet, just store and move on
     if not lastJob then
         prevJobs[src] = {
             name  = newJob.name,
@@ -251,7 +270,6 @@ AddEventHandler('QBCore:Server:OnJobUpdate', function(src, newJob)
         return
     end
 
-    -- Real job change – log it
     local date, time = GetDateTime()
     local name      = GetPlayerName(src) or 'Unknown'
     local citizenid = Player.PlayerData.citizenid
@@ -271,7 +289,6 @@ AddEventHandler('QBCore:Server:OnJobUpdate', function(src, newJob)
         },
     })
 
-    -- Update cache
     prevJobs[src] = {
         name  = newJob.name,
         label = newJob.label,
@@ -279,18 +296,17 @@ AddEventHandler('QBCore:Server:OnJobUpdate', function(src, newJob)
     }
 end)
 
--- Clean up job cache when player logs out to character select.
--- playerCache is intentionally NOT cleared here so that the disconnect
--- log still fires if the player quits after going back to char select.
+-- Clean up job cache on logout. playerCache intentionally kept so that
+-- the disconnect log still fires if the player quits from char select.
 AddEventHandler('QBCore:Server:OnPlayerUnload', function(src)
-    prevJobs[src] = nil
+    prevJobs[src]        = nil
+    pendingNewChars[src] = nil
 end)
 
 -- ── Dev / test commands ───────────────────────────────────────────
 --
---  Use these commands in-game (god / superadmin only) to verify that
---  your Discord webhooks and okokChat announcements are working before
---  real players trigger the live events.
+--  God-only commands to verify Discord webhooks and chat announcements
+--  before live players trigger real events.
 --
 --  Usage:  /logplayerconnect   /logplayerdisconnect   /logplayernew
 --          /logplayerdied      /logjobchange
