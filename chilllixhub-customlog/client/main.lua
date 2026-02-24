@@ -2,6 +2,11 @@
 --  chilllixhub-customlog  ·  client/main.lua
 --  Detects player death and forwards the event to the server so the
 --  server-side logger can record cause / reason.
+--
+--  FIX: Replaced QBCore:Player:SetPlayerData + isdead metadata approach
+--  with a native IsPedDeadOrDying polling thread.  This works regardless
+--  of whether another resource (e.g. qb-ambulancejob) is setting the
+--  isdead metadata, and also works when this resource starts mid-session.
 -- ─────────────────────────────────────────────────────────────────
 
 local QBCore  = exports['qb-core']:GetCoreObject()
@@ -27,28 +32,32 @@ local function GetDeathCause()
     return cause
 end
 
--- ── Death detection via QBCore metadata ──────────────────────────
+-- ── Death detection via native ped state ─────────────────────────
 --
--- Both events are fired from the server via TriggerClientEvent, so they
--- must be declared as network-safe with RegisterNetEvent before being
--- used in AddEventHandler.  Without this FiveM prints:
---   "event <name> was not safe for net"
+-- Uses LocalPlayer.state.isLoggedIn (set by qb-core) as the gate so
+-- we never fire before the player has a character loaded.  This state
+-- bag value persists even when the resource is restarted mid-session.
+-- A 1-second poll is cheap and catches every death reliably.
 
-RegisterNetEvent('QBCore:Player:SetPlayerData')
-AddEventHandler('QBCore:Player:SetPlayerData', function(PlayerData)
-    if not LocalPlayer.state.isLoggedIn then return end
-    if not PlayerData.metadata then return end
+CreateThread(function()
+    while true do
+        Wait(500)
 
-    local nowDead = PlayerData.metadata['isdead'] or false
+        if LocalPlayer.state.isLoggedIn then
+            local ped     = PlayerPedId()
+            local nowDead = IsPedDeadOrDying(ped, true)
 
-    if nowDead and not wasDead then
-        TriggerServerEvent('chilllixhub-customlog:server:playerDied', GetDeathCause())
+            if nowDead and not wasDead then
+                TriggerServerEvent('chilllixhub-customlog:server:playerDied', GetDeathCause())
+            end
+
+            wasDead = nowDead
+        end
     end
-
-    wasDead = nowDead
 end)
 
--- Reset flag on character unload
+-- Reset dead flag when player unloads their character (logout / char select).
+-- RegisterNetEvent required because QBCore:Client:OnPlayerUnload is a net event.
 RegisterNetEvent('QBCore:Client:OnPlayerUnload')
 AddEventHandler('QBCore:Client:OnPlayerUnload', function()
     wasDead = false
