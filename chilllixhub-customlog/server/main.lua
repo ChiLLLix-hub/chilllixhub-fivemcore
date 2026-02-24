@@ -74,25 +74,19 @@ local function SendDiscordEmbed(logType, embed)
     end, 'POST', payload, { ['Content-Type'] = 'application/json' })
 end
 
---- Broadcast a server announcement.
---- Uses okokChat if the resource is running; falls back to the native
---- FiveM chat:addMessage event (used by every other resource in this repo).
+--- Broadcast a server announcement to all players.
+--- Uses the standard FiveM chat:addMessage event.
+--- okokChat (chillixhub_okok/okokChat) is a NUI replacement that registers
+--- chat:addMessage on the client, so this call works correctly whether
+--- okokChat is installed or the native chat is used.
 --- @param message  string   Full message text
 --- @param color    table    { R, G, B }
 local function ChatAnnounce(message, color)
-    if GetResourceState('okokChat') == 'started' then
-        TriggerClientEvent('okokChat:client:addMessage', -1, {
-            color     = color,
-            multiline = true,
-            args      = { 'Server', message },
-        })
-    else
-        TriggerClientEvent('chat:addMessage', -1, {
-            color     = color,
-            multiline = true,
-            args      = { 'Server', message },
-        })
-    end
+    TriggerClientEvent('chat:addMessage', -1, {
+        color     = color,
+        multiline = true,
+        args      = { 'Server', message },
+    })
 end
 
 --- Populate the player cache and job cache for a freshly-loaded player.
