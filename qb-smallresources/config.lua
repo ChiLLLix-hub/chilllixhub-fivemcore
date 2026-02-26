@@ -259,6 +259,18 @@ Config.Teleports = {
             allowVeh = false,
             label = '[E] Leave'
         }
+    },
+    [3] = { --AFK Zone Enter/Exit
+        [1] = {
+            poly = { coords = vector3(211.72, -919.45, 30.69), heading = 314.95, length = 2, width = 2 },
+            allowVeh = false,
+            label = '[E] Leave AFK Zone'
+        },
+        [2] = {
+            poly = { coords = vector3(446.29, 5580.88, 783.19), heading = 359.01, length = 2, width = 2 },
+            allowVeh = false,
+            label = '[E] Enter AFK Zone'
+        }
     }
 }
 
